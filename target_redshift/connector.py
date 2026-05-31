@@ -24,6 +24,9 @@ from sqlalchemy.types import (
 )
 from sqlalchemy_redshift.dialect import BIGINT, DOUBLE_PRECISION, SUPER, VARCHAR
 
+if t.TYPE_CHECKING:
+    from singer_sdk.connectors.sql import FullyQualifiedName
+
 
 class RedshiftConnector(SQLConnector):
     """Sets up SQL Alchemy, and other Postgres related stuff."""
@@ -35,24 +38,94 @@ class RedshiftConnector(SQLConnector):
     allow_temp_tables: bool = True  # Whether temp tables are supported.
     default_varchar_length = 10000
 
+    def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
+        """Initialize the connector and per-run caches.
+
+        See super class for more details.
+        """
+        super().__init__(*args, **kwargs)
+        self._connection: redshift_connector.Connection | None = None
+        self._table_cache: dict[tuple[str, str], Table] = {}  # key: (schema_lower, table_lower)
+        self._schemas_prepared: set[str] = set()
+        self._privileges_granted: set[str] = set()
+        self._schemas_cached: set[str] = set()  # for optional bulk preload
+
+    def _get_or_create_connection(self) -> redshift_connector.Connection:
+        """Return a shared connection, reconnecting if it has dropped.
+
+        Returns:
+            A live redshift_connector connection.
+        """
+        try:
+            if self._connection is not None:
+                with self._connection.cursor() as c:
+                    c.execute("SELECT 1")
+        except Exception:  # noqa: BLE001 - any failure means reconnect
+            self._connection = None
+
+        if self._connection is None:
+            user, password = self.get_credentials()
+            self._connection = redshift_connector.connect(
+                user=user,
+                password=password,
+                host=self.config["host"],
+                port=self.config["port"],
+                database=self.config["dbname"],
+                ssl=self.config["ssl_enable"],
+                sslmode=self.config["ssl_mode"],
+            )
+        return self._connection
+
+    def _cache_key(self, full_table_name: str | FullyQualifiedName) -> tuple[str, str]:
+        """Return a normalised (schema, table) cache key.
+
+        Redshift folds identifiers to lowercase, and the string form of a
+        ``FullyQualifiedName`` is dialect-quoted, so we always derive the key
+        from ``parse_full_table_name`` to avoid quoting/case mismatches.
+
+        Args:
+            full_table_name: Fully qualified table name.
+
+        Returns:
+            A ``(schema_lower, table_lower)`` tuple.
+        """
+        _, schema_name, table_name = self.parse_full_table_name(full_table_name)
+        return (schema_name or "").lower(), (table_name or "").lower()
+
+    def invalidate_table_cache(self, full_table_name: str) -> None:
+        """Drop a table from the cache so the next get_table() re-reflects it.
+
+        Args:
+            full_table_name: Fully qualified table name.
+        """
+        self._table_cache.pop(self._cache_key(full_table_name), None)
+
     def prepare_schema(self, schema_name: str, cursor: Cursor) -> None:
         """Create the target database schema.
+
+        Skips work if the schema was already prepared during this run.
 
         Args:
             schema_name: The target schema name.
             cursor: The database cursor.
         """
-        schema_exists = self.schema_exists(schema_name)
-        if not schema_exists:
+        if schema_name in self._schemas_prepared:
+            return
+        if not self.schema_exists(schema_name):
             self.create_schema(schema_name, cursor=cursor)
+        self._schemas_prepared.add(schema_name)
 
     def grant_privileges(self, schema_name: str, cursor: Cursor) -> None:
         """Grant privileges to the target schema.
 
+        Skips work if privileges were already granted during this run.
+
         Args:
             schema_name: The target schema name.
             cursor: The database cursor.
         """
+        if schema_name in self._privileges_granted:
+            return
         for grantee in self.config.get("grants", []):
             cursor.execute(f"grant usage on schema {schema_name} to {grantee};")
             cursor.execute(f"grant select on all tables in schema {schema_name} to {grantee};")
@@ -60,6 +133,7 @@ class RedshiftConnector(SQLConnector):
                 f"alter default privileges for user {self.config['user']} "
                 f"in schema {schema_name} grant select on tables to {grantee};"
             )
+        self._privileges_granted.add(schema_name)
 
     def create_schema(self, schema_name: str, cursor: Cursor) -> None:
         """Create target schema.
@@ -84,19 +158,10 @@ class RedshiftConnector(SQLConnector):
         Iterator[t.Iterator[Cursor]]
             A redshift connector cursor.
         """
-        user, password = self.get_credentials()
-        with redshift_connector.connect(
-            user=user,
-            password=password,
-            host=self.config["host"],
-            port=self.config["port"],
-            database=self.config["dbname"],
-            ssl=self.config["ssl_enable"],
-            sslmode=self.config["ssl_mode"],
-        ) as connection:
-            with connection.cursor() as cursor:
-                yield cursor
-            connection.commit()
+        conn = self._get_or_create_connection()
+        with conn.cursor() as cursor:
+            yield cursor
+        conn.commit()
 
     def prepare_table(  # type: ignore[override]  # noqa: D417, PLR0913
         self,
@@ -153,7 +218,7 @@ class RedshiftConnector(SQLConnector):
         self,
         full_table_name: str,
     ) -> Table:
-        """Return a table object.
+        """Return a table object, cached to avoid repeated reflection.
 
         Args:
             full_table_name: Fully qualified table name.
@@ -162,13 +227,62 @@ class RedshiftConnector(SQLConnector):
         Returns:
             A table object with column list.
         """
+        key = self._cache_key(full_table_name)
+        cached = self._table_cache.get(key)
+        if cached is not None:
+            return cached
         _, schema_name, table_name = self.parse_full_table_name(full_table_name)
         meta = MetaData(schema=schema_name)
-        return Table(
+        table = Table(
             table_name,
             meta,
             autoload_with=self._engine,
         )
+        self._table_cache[key] = table
+        return table
+
+    def _get_column_type(  # type: ignore[override]
+        self,
+        full_table_name: str,
+        column_name: str,
+    ) -> TypeEngine:
+        """Resolve a column's existing type from the cached Table.
+
+        Routing through ``get_table`` avoids the per-column reflection the SDK
+        base would otherwise perform inside ``_adapt_column_type``.
+
+        Args:
+            full_table_name: Fully qualified table name.
+            column_name: The column to resolve.
+
+        Returns:
+            The SQLAlchemy type of the existing column.
+
+        Raises:
+            KeyError: if the column does not exist on the table.
+        """
+        table = self.get_table(full_table_name)
+        try:
+            return table.columns[column_name].type
+        except KeyError as ex:
+            msg = f"Column `{column_name}` does not exist in table `{full_table_name}`."
+            raise KeyError(msg) from ex
+
+    def table_exists(self, full_table_name: str) -> bool:  # type: ignore[override]
+        """Check whether a table exists, using a positive cache.
+
+        A cached table definitely exists; otherwise defer to the base
+        implementation (which performs the reflection-based check).
+
+        Args:
+            full_table_name: Fully qualified table name.
+
+        Returns:
+            True if the table exists.
+        """
+        if self._cache_key(full_table_name) in self._table_cache:
+            return True
+        return super().table_exists(full_table_name)
 
     def copy_table_structure(
         self,
@@ -294,6 +408,7 @@ class RedshiftConnector(SQLConnector):
 
         create_table_ddl = str(CreateTable(new_table).compile(dialect=self._engine.dialect))
         cursor.execute(create_table_ddl)
+        self._table_cache[((meta.schema or "").lower(), table_name.lower())] = new_table
         return new_table
 
     def prepare_column(  # noqa: PLR0913
@@ -365,6 +480,7 @@ class RedshiftConnector(SQLConnector):
             )
         )
         cursor.execute(column_add_ddl)
+        self.invalidate_table_cache(full_table_name)
 
     def get_column_add_ddl(  # type: ignore[override]
         self,
@@ -459,6 +575,7 @@ class RedshiftConnector(SQLConnector):
             )
         )
         cursor.execute(alter_column_ddl)
+        self.invalidate_table_cache(full_table_name)
 
     def get_column_alter_ddl(  # type: ignore[override]
         self,
