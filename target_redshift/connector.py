@@ -44,37 +44,9 @@ class RedshiftConnector(SQLConnector):
         See super class for more details.
         """
         super().__init__(*args, **kwargs)
-        self._connection: redshift_connector.Connection | None = None
         self._table_cache: dict[tuple[str, str], Table] = {}  # key: (schema_lower, table_lower)
         self._schemas_prepared: set[str] = set()
         self._privileges_granted: set[str] = set()
-        self._schemas_cached: set[str] = set()  # for optional bulk preload
-
-    def _get_or_create_connection(self) -> redshift_connector.Connection:
-        """Return a shared connection, reconnecting if it has dropped.
-
-        Returns:
-            A live redshift_connector connection.
-        """
-        try:
-            if self._connection is not None:
-                with self._connection.cursor() as c:
-                    c.execute("SELECT 1")
-        except Exception:  # noqa: BLE001 - any failure means reconnect
-            self._connection = None
-
-        if self._connection is None:
-            user, password = self.get_credentials()
-            self._connection = redshift_connector.connect(
-                user=user,
-                password=password,
-                host=self.config["host"],
-                port=self.config["port"],
-                database=self.config["dbname"],
-                ssl=self.config["ssl_enable"],
-                sslmode=self.config["ssl_mode"],
-            )
-        return self._connection
 
     def _cache_key(self, full_table_name: str | FullyQualifiedName) -> tuple[str, str]:
         """Return a normalised (schema, table) cache key.
@@ -158,10 +130,19 @@ class RedshiftConnector(SQLConnector):
         Iterator[t.Iterator[Cursor]]
             A redshift connector cursor.
         """
-        conn = self._get_or_create_connection()
-        with conn.cursor() as cursor:
-            yield cursor
-        conn.commit()
+        user, password = self.get_credentials()
+        with redshift_connector.connect(
+            user=user,
+            password=password,
+            host=self.config["host"],
+            port=self.config["port"],
+            database=self.config["dbname"],
+            ssl=self.config["ssl_enable"],
+            sslmode=self.config["ssl_mode"],
+        ) as connection:
+            with connection.cursor() as cursor:
+                yield cursor
+            connection.commit()
 
     def prepare_table(  # type: ignore[override]  # noqa: D417, PLR0913
         self,
