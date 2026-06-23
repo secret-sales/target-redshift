@@ -16,8 +16,6 @@ if TYPE_CHECKING:
 class TargetRedshift(SQLTarget):
     """Target for Redshift."""
 
-    _MAX_RECORD_AGE_IN_MINUTES: float = 60
-
     def __init__(
         self,
         config: dict | PurePath | str | list[PurePath | str] | None = None,
@@ -40,6 +38,7 @@ class TargetRedshift(SQLTarget):
             parse_env_config=parse_env_config,
             validate_config=validate_config,
         )
+        self._MAX_RECORD_AGE_IN_MINUTES = self.config.get("max_batch_age_minutes", 60)
 
         assert self.config.get("add_record_metadata") or not self.config.get(  # noqa: S101
             "activate_version"
@@ -206,6 +205,16 @@ class TargetRedshift(SQLTarget):
             th.BooleanType,
             default=True,
             description=("If true, the target will log a warning when a record is not found in the schema."),
+        ),
+        th.Property(
+            "max_batch_age_minutes",
+            th.NumberType,
+            default=60,
+            description=(
+                "Maximum age of a batch in minutes before it is force-flushed to Redshift. "
+                "Increase this when performing full historical syncs of large, sparse tables "
+                "where the default 60-minute limit causes the run to abort prematurely."
+            ),
         ),
     ).to_dict()
 
