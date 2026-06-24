@@ -6,7 +6,7 @@ import csv
 import os
 import uuid
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterable
+from typing import TYPE_CHECKING, Any, Iterable, Iterator
 
 import boto3
 import simplejson as json
@@ -232,46 +232,41 @@ class RedshiftSink(SQLSink):
                 """  # noqa: S608
         cursor.execute(sql)
 
-    def format_records_as_csv(self, records: Iterable[dict[str, Any]]) -> list[dict]:
-        """Write records to a local csv file.
+    def format_records_as_csv(self, records: Iterable[dict[str, Any]]) -> Iterator[dict]:
+        """Yield records conformed for CSV writing.
+
+        Yields one dict at a time rather than materialising the full batch as a list,
+        keeping memory usage proportional to a single row rather than the whole batch.
 
         Parameters
         ----------
-        records : List[dict]
+        records : Iterable[dict]
             the input records.
-
-        Returns:
-        -------
-        None
 
         Raises:
         ------
         ValueError
-            _description_
+            If the stream schema has no properties defined.
         """
         if "properties" not in self.schema:
             msg = "Stream's schema has no properties defined."
             raise ValueError(msg)
-        object_keys = [
+        object_keys = {
             key
             for key, value in self.conformed_schema["properties"].items()
             if _jsonschema_type_check(value, ("object", "array"))
-        ]
-        return [
-            {
+        }
+        for record in records:
+            yield {
                 key: (json.dumps(value).replace("None", "") if key in object_keys else value)
                 for key, value in self.conform_record(record).items()
             }
-            for record in records
-        ]
 
     def write_to_s3(self, records: Iterable[dict[str, Any]]) -> None:
         """Write the csv file to s3."""
-        records = self.format_records_as_csv(records)
         keys: list[str] = list(self.conformed_schema["properties"].keys())
 
-        msg = f"writing {len(records)} records to {self.s3_uri()}"
-        self.logger.info(msg)
+        self.logger.info("writing batch to %s", self.s3_uri())
 
         with smart_open.open(self.s3_uri(), "w") as fp:
             writer = csv.DictWriter(
@@ -280,7 +275,7 @@ class RedshiftSink(SQLSink):
                 extrasaction="ignore",
                 dialect="excel",
             )
-            writer.writerows(records)
+            writer.writerows(self.format_records_as_csv(records))
 
     def copy_to_redshift(self, table: sqlalchemy.Table, cursor: Cursor) -> None:
         """Copy the s3 csv file to redshift."""
